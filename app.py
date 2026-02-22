@@ -6,23 +6,32 @@ import os
 import base64
 import av
 import queue
+import random  # เพิ่มเพื่อช่วยให้เบราว์เซอร์ไม่จำแคชเสียง
 from mediapipe.tasks import python as tasks
 from mediapipe.tasks.python import vision
 from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
 
-# --- 1. ตั้งค่าหน้าเว็บ (ต้องอยู่บรรทัดแรก) ---
+# --- 1. ตั้งค่าหน้าเว็บ ---
 st.set_page_config(page_title="SafeDrive AI", layout="centered")
 
-# คิวสำหรับส่งข้อมูลจากกล้องมายังหน้าจอหลัก
-result_queue = queue.Queue()
+# คิวสำหรับส่งข้อมูลสถานะง่วงนอน
+if "result_queue" not in st.session_state:
+    st.session_state.result_queue = queue.Queue()
 
-# --- 2. ฟังก์ชันเล่นเสียงเตือน ---
+# --- 2. ฟังก์ชันเล่นเสียงเตือน (แก้ไขให้ทะลุข้อจำกัดเบราว์เซอร์มากขึ้น) ---
 def play_alarm_sound(file_path):
     if os.path.exists(file_path):
         with open(file_path, "rb") as f:
             data = f.read()
             b64 = base64.b64encode(data).decode()
-            md = f'<audio autoplay="true"><source src="data:audio/mp3;base64,{b64}" type="audio/mp3"></audio>'
+            rid = random.randint(0, 1000) # ป้องกันเบราว์เซอร์มองว่าเป็นเสียงเดิมที่เคยเล่นแล้ว
+            # ใช้ Iframe ผสม Audio เพื่อช่วยให้ระบบ Autoplay ทำงานง่ายขึ้น
+            md = f"""
+                <iframe src="data:audio/mp3;base64,{b64}" allow="autoplay" style="display:none"></iframe>
+                <audio autoplay="true" id="audio_{rid}">
+                    <source src="data:audio/mp3;base64,{b64}" type="audio/mp3">
+                </audio>
+                """
             st.markdown(md, unsafe_allow_html=True)
 
 # --- 3. ตั้งค่าโมเดล Mediapipe ---
@@ -49,7 +58,7 @@ RTC_CONFIG = RTCConfiguration(
     ]}
 )
 
-# --- 5. ส่วนประมวลผลวิดีโอ (VideoProcessor) ---
+# --- 5. ส่วนประมวลผลวิดีโอ ---
 class VideoProcessor:
     def __init__(self):
         self.counter = 0
@@ -58,7 +67,6 @@ class VideoProcessor:
         img = frame.to_ndarray(format="bgr24")
         h, w = img.shape[:2]
         
-        # ลดขนาดภาพเพื่อความเร็ว
         img_small = cv2.resize(img, (w//2, h//2))
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(img_small, cv2.COLOR_BGR2RGB))
         results = detector.detect(mp_image)
@@ -67,19 +75,18 @@ class VideoProcessor:
 
         if results.face_landmarks:
             face_landmarks = results.face_landmarks[0]
-            # คำนวณระยะห่างเปลือกตา
             eye_dist = abs(face_landmarks[159].y - face_landmarks[145].y)
 
-            if eye_dist < 0.012: # ค่าความไวในการหลับตา
+            if eye_dist < 0.012: 
                 self.counter += 1
             else:
                 self.counter = 0
 
-            if self.counter > 6: # หลับตาติดต่อกันเกิน 6 เฟรม
+            if self.counter > 6: 
                 drowsy_detected = True
 
-        # ส่งสถานะไปยังหน้าจอหลักผ่าน Queue
-        result_queue.put(drowsy_detected)
+        # ส่งสถานะไปยัง Queue ใน session_state
+        st.session_state.result_queue.put(drowsy_detected)
 
         if drowsy_detected:
             cv2.rectangle(img, (0,0), (w,h), (0,0,255), 20)
@@ -99,17 +106,35 @@ st.markdown("""
         color: white;
         margin-bottom: 10px;
     }
+    .stButton>button {
+        width: 100%;
+        height: 60px;
+        background-color: #4CAF50;
+        color: white;
+        font-weight: bold;
+        border-radius: 10px;
+    }
     </style>
     """, unsafe_allow_html=True)
 
 st.title("🛡️ SafeDrive AI")
 st.write("ระบบตรวจจับความปลอดภัยสำหรับผู้ขับขี่")
 
+# --- จุดสำคัญ: ปุ่มเพื่อปลดล็อกเสียง ---
+if 'audio_ready' not in st.session_state:
+    st.session_state.audio_ready = False
+
+if not st.session_state.audio_ready:
+    st.warning("🔔 โปรดคลิกปุ่มด้านล่างเพื่อเปิดการแจ้งเตือนด้วยเสียง")
+    if st.button("📢 ยืนยันเปิดเสียงแจ้งเตือน (คลิกที่นี่ก่อนเริ่ม)"):
+        st.session_state.audio_ready = True
+        st.rerun()
+
 status_placeholder = st.empty()
 
 # เริ่มระบบ WebRTC
 webrtc_ctx = webrtc_streamer(
-    key="safe-drive-final",
+    key="safe-drive-v4",
     mode=WebRtcMode.SENDRECV,
     rtc_configuration=RTC_CONFIG,
     video_processor_factory=VideoProcessor,
@@ -117,23 +142,25 @@ webrtc_ctx = webrtc_streamer(
     async_processing=True,
 )
 
-# --- 7. ตรรกะการเช็กสถานะจาก Queue และเล่นเสียง ---
+# --- 7. ตรรกะการเช็กสถานะและเล่นเสียง ---
 if webrtc_ctx.state.playing:
     is_drowsy = False
     try:
-        # ดึงค่าล่าสุดจากคิว
-        while not result_queue.empty():
-            is_drowsy = result_queue.get_nowait()
-    except queue.Empty:
+        # ดึงสถานะล่าสุด
+        while not st.session_state.result_queue.empty():
+            is_drowsy = st.session_state.result_queue.get_nowait()
+    except:
         pass
 
     if is_drowsy:
         status_placeholder.markdown('<div class="status-box" style="background-color: #FF0000;">⚠️ ตรวจพบอาการง่วงนอน! ⚠️</div>', unsafe_allow_html=True)
-        play_alarm_sound("warningsound.mp3")
+        # เล่นเสียงเฉพาะเมื่อผู้ใช้กดยืนยันปุ่มเปิดเสียงแล้ว
+        if st.session_state.audio_ready:
+            play_alarm_sound("warningsound.mp3")
     else:
         status_placeholder.markdown('<div class="status-box" style="background-color: #28a745;">✅ สถานะ: ปกติ</div>', unsafe_allow_html=True)
 else:
-    status_placeholder.info("กรุณากดปุ่ม START ด้านล่างเพื่อเริ่มการตรวจจับ")
+    status_placeholder.info("กรุณากดปุ่ม START ในกรอบวิดีโอเพื่อเริ่มการตรวจจับ")
 
 st.divider()
-st.info("💡 **คำแนะนำ:** แตะหน้าจอ 1 ครั้งเพื่อให้ระบบเสียงทำงาน และวางมือถือให้เห็นใบหน้าชัดเจน")
+st.info("💡 **คำแนะนำ:** หากเสียงไม่ดัง ให้ลองกดปุ่มยืนยันเปิดเสียงอีกครั้ง และวางมือถือให้เห็นใบหน้าชัดเจน")
