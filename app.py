@@ -6,7 +6,7 @@ import os
 import base64
 import av
 import queue
-import random  # เพิ่มเพื่อช่วยให้เบราว์เซอร์ไม่จำแคชเสียง
+import random
 from mediapipe.tasks import python as tasks
 from mediapipe.tasks.python import vision
 from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
@@ -14,27 +14,26 @@ from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
 # --- 1. ตั้งค่าหน้าเว็บ ---
 st.set_page_config(page_title="SafeDrive AI", layout="centered")
 
-# คิวสำหรับส่งข้อมูลสถานะง่วงนอน
+# สร้าง Queue เพื่อส่งค่าระหว่าง Thread (ป้องกัน AttributeError)
 if "result_queue" not in st.session_state:
     st.session_state.result_queue = queue.Queue()
 
-# --- 2. ฟังก์ชันเล่นเสียงเตือน (แก้ไขให้ทะลุข้อจำกัดเบราว์เซอร์มากขึ้น) ---
+# --- 2. ฟังก์ชันเล่นเสียงเตือน (ปลดล็อก Autoplay) ---
 def play_alarm_sound(file_path):
     if os.path.exists(file_path):
         with open(file_path, "rb") as f:
             data = f.read()
             b64 = base64.b64encode(data).decode()
-            rid = random.randint(0, 1000) # ป้องกันเบราว์เซอร์มองว่าเป็นเสียงเดิมที่เคยเล่นแล้ว
-            # ใช้ Iframe ผสม Audio เพื่อช่วยให้ระบบ Autoplay ทำงานง่ายขึ้น
+            rid = random.randint(0, 9999)
             md = f"""
-                <iframe src="data:audio/mp3;base64,{b64}" allow="autoplay" style="display:none"></iframe>
-                <audio autoplay="true" id="audio_{rid}">
+                <iframe src="data:audio/mp3;base64,{b64}" allow="autoplay" style="display:none" id="f_{rid}"></iframe>
+                <audio autoplay="true" id="a_{rid}">
                     <source src="data:audio/mp3;base64,{b64}" type="audio/mp3">
                 </audio>
                 """
             st.markdown(md, unsafe_allow_html=True)
 
-# --- 3. ตั้งค่าโมเดล Mediapipe ---
+# --- 3. โหลด AI Model ---
 model_path = "face_landmarker.task"
 
 @st.cache_resource
@@ -48,17 +47,16 @@ def get_mediapipe_detector():
 
 detector = get_mediapipe_detector()
 
-# --- 4. การตั้งค่าระบบเชื่อมต่อ (STUN Servers) ---
+# --- 4. ตั้งค่า WebRTC (STUN Servers เพื่อทะลุ Wi-Fi) ---
 RTC_CONFIG = RTCConfiguration(
     {"iceServers": [
         {"urls": ["stun:stun.l.google.com:19302", 
                   "stun:stun1.l.google.com:19302", 
-                  "stun:stun2.l.google.com:19302", 
                   "stun:global.stun.twilio.com:3478"]}
     ]}
 )
 
-# --- 5. ส่วนประมวลผลวิดีโอ ---
+# --- 5. Class ประมวลผลวิดีโอ ---
 class VideoProcessor:
     def __init__(self):
         self.counter = 0
@@ -67,6 +65,7 @@ class VideoProcessor:
         img = frame.to_ndarray(format="bgr24")
         h, w = img.shape[:2]
         
+        # ลดขนาดภาพเพื่อความลื่นและลดอาการค้างบน Wi-Fi
         img_small = cv2.resize(img, (w//2, h//2))
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(img_small, cv2.COLOR_BGR2RGB))
         results = detector.detect(mp_image)
@@ -75,9 +74,10 @@ class VideoProcessor:
 
         if results.face_landmarks:
             face_landmarks = results.face_landmarks[0]
+            # ระยะห่างเปลือกตา (EAR)
             eye_dist = abs(face_landmarks[159].y - face_landmarks[145].y)
 
-            if eye_dist < 0.012: 
+            if eye_dist < 0.012: # ปรับความไว
                 self.counter += 1
             else:
                 self.counter = 0
@@ -85,7 +85,6 @@ class VideoProcessor:
             if self.counter > 6: 
                 drowsy_detected = True
 
-        # ส่งสถานะไปยัง Queue ใน session_state
         st.session_state.result_queue.put(drowsy_detected)
 
         if drowsy_detected:
@@ -94,73 +93,51 @@ class VideoProcessor:
         
         return av.VideoFrame.from_ndarray(img, format="bgr24")
 
-# --- 6. ส่วนการแสดงผล UI ---
-st.markdown("""
-    <style>
-    .status-box {
-        padding: 20px;
-        border-radius: 15px;
-        text-align: center;
-        font-size: 30px;
-        font-weight: bold;
-        color: white;
-        margin-bottom: 10px;
-    }
-    .stButton>button {
-        width: 100%;
-        height: 60px;
-        background-color: #4CAF50;
-        color: white;
-        font-weight: bold;
-        border-radius: 10px;
-    }
-    </style>
-    """, unsafe_allow_html=True)
-
+# --- 6. UI และปุ่มกด ---
 st.title("🛡️ SafeDrive AI")
-st.write("ระบบตรวจจับความปลอดภัยสำหรับผู้ขับขี่")
+st.write("ระบบตรวจจับความปลอดภัย (เวอร์ชันสมบูรณ์)")
 
-# --- จุดสำคัญ: ปุ่มเพื่อปลดล็อกเสียง ---
-if 'audio_ready' not in st.session_state:
-    st.session_state.audio_ready = False
+# ปุ่มปลดล็อกเสียง
+if 'audio_unlocked' not in st.session_state:
+    st.session_state.audio_unlocked = False
 
-if not st.session_state.audio_ready:
-    st.warning("🔔 โปรดคลิกปุ่มด้านล่างเพื่อเปิดการแจ้งเตือนด้วยเสียง")
-    if st.button("📢 ยืนยันเปิดเสียงแจ้งเตือน (คลิกที่นี่ก่อนเริ่ม)"):
-        st.session_state.audio_ready = True
+if not st.session_state.audio_unlocked:
+    if st.button("📢 คลิกที่นี่เพื่อเปิดระบบเสียง (ทำครั้งเดียวก่อนเริ่ม)"):
+        st.session_state.audio_unlocked = True
         st.rerun()
 
 status_placeholder = st.empty()
 
-# เริ่มระบบ WebRTC
+# ส่วนของกล้อง (ปรับ Resolution ให้ต่ำลงเพื่อป้องกันอาการค้าง)
 webrtc_ctx = webrtc_streamer(
-    key="safe-drive-v4",
+    key="safedrive-v5",
     mode=WebRtcMode.SENDRECV,
     rtc_configuration=RTC_CONFIG,
     video_processor_factory=VideoProcessor,
-    media_stream_constraints={"video": True, "audio": False},
+    media_stream_constraints={
+        "video": {"width": 320, "height": 240, "frameRate": 15},
+        "audio": False
+    },
     async_processing=True,
 )
 
-# --- 7. ตรรกะการเช็กสถานะและเล่นเสียง ---
+# --- 7. เช็กผลและเล่นเสียง ---
 if webrtc_ctx.state.playing:
     is_drowsy = False
     try:
-        # ดึงสถานะล่าสุด
         while not st.session_state.result_queue.empty():
             is_drowsy = st.session_state.result_queue.get_nowait()
     except:
         pass
 
     if is_drowsy:
-        status_placeholder.markdown('<div class="status-box" style="background-color: #FF0000;">⚠️ ตรวจพบอาการง่วงนอน! ⚠️</div>', unsafe_allow_html=True)
-        # เล่นเสียงเฉพาะเมื่อผู้ใช้กดยืนยันปุ่มเปิดเสียงแล้ว
-        if st.session_state.audio_ready:
+        status_placeholder.markdown('<div style="background-color:#FF0000; color:white; padding:20px; border-radius:15px; text-align:center; font-size:30px; font-weight:bold;">⚠️ ตื่นๆ! ตรวจพบอาการง่วง ⚠️</div>', unsafe_allow_html=True)
+        if st.session_state.audio_unlocked:
             play_alarm_sound("warningsound.mp3")
     else:
-        status_placeholder.markdown('<div class="status-box" style="background-color: #28a745;">✅ สถานะ: ปกติ</div>', unsafe_allow_html=True)
+        status_placeholder.markdown('<div style="background-color:#28a745; color:white; padding:20px; border-radius:15px; text-align:center; font-size:30px; font-weight:bold;">✅ สถานะ: ปกติ</div>', unsafe_allow_html=True)
 else:
-    status_placeholder.info("กรุณากดปุ่ม START ในกรอบวิดีโอเพื่อเริ่มการตรวจจับ")
+    status_placeholder.warning("กรุณากด START เพื่อเปิดกล้อง")
 
 st.divider()
-st.info("💡 **คำแนะนำ:** หากเสียงไม่ดัง ให้ลองกดปุ่มยืนยันเปิดเสียงอีกครั้ง และวางมือถือให้เห็นใบหน้าชัดเจน")
+st.info("💡 หากกล้องค้างหรือขึ้น Connecting นานเกินไป ให้ลองสลับจาก Wi-Fi เป็นเน็ตมือถือ (4G/5G) ครับ")
