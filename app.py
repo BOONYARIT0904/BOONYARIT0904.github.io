@@ -1,13 +1,16 @@
 import streamlit as st
 import cv2
 import mediapipe as mp
-import time
 import numpy as np
 import os
 import base64
 from mediapipe.tasks import python as tasks
 from mediapipe.tasks.python import vision
+from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
+import av
 
+# --- ตั้งค่าหน้าเว็บ (ต้องอยู่บรรทัดแรกของโค้ด) ---
+st.set_page_config(page_title="SafeDrive AI", layout="centered")
 
 # --- 1. ฟังก์ชันเล่นเสียง ---
 def play_alarm_sound(file_path):
@@ -15,159 +18,105 @@ def play_alarm_sound(file_path):
         with open(file_path, "rb") as f:
             data = f.read()
             b64 = base64.b64encode(data).decode()
-            md = f"""
-                <audio autoplay="true">
-                <source src="data:audio/mp3;base64,{b64}" type="audio/mp3">
-                </audio>
-                """
-        st.markdown(md, unsafe_allow_html=True)
-    else:
-        st.error(f"ไฟล์เสียง {file_path} หายไป!")
+            md = f'<audio autoplay="true"><source src="data:audio/mp3;base64,{b64}" type="audio/mp3"></audio>'
+            st.markdown(md, unsafe_allow_html=True)
 
-
-# --- 2. ตั้งค่าโมเดล ---
+# --- 2. ตั้งค่าโมเดล AI ---
 model_path = "face_landmarker.task"
 
-if not os.path.exists(model_path):
-    st.error(f"ไม่พบไฟล์โมเดลที่: {model_path}")
-    st.stop()
-
-
 @st.cache_resource
-def get_mediapipe_detector(model_path_arg):
-    base_options = tasks.BaseOptions(model_asset_path=model_path_arg)
-    options = vision.FaceLandmarkerOptions(base_options=base_options,
-                                           output_face_blendshapes=False,
-                                           output_facial_transformation_matrixes=False,
-                                           num_faces=1)
+def get_mediapipe_detector():
+    base_options = tasks.BaseOptions(model_asset_path=model_path)
+    options = vision.FaceLandmarkerOptions(
+        base_options=base_options,
+        output_face_blendshapes=False,
+        num_faces=1)
     return vision.FaceLandmarker.create_from_options(options)
 
+detector = get_mediapipe_detector()
 
-detector = get_mediapipe_detector(model_path)
-
-# --- 3. UI Settings ---
-st.title("Driver eye")
-st.sidebar.header("Settings")
-
-if 'COUNTER' not in st.session_state: st.session_state.COUNTER = 0
-if 'ALARM_ON' not in st.session_state: st.session_state.ALARM_ON = False
-if 'running' not in st.session_state: st.session_state.running = False
-
-EYE_CLOSED_LIMIT = st.sidebar.slider("Sensitivity", 5, 30, 10)
-alarm_sound_enabled = st.sidebar.checkbox("Enable Alarm", value=True)
-
-start_btn = st.sidebar.button("Start Detection")
-stop_btn = st.sidebar.button("Stop Detection")
-
-st.subheader("Real-time Video Feed")
-video_placeholder = st.empty()
-status_placeholder = st.empty()
-
-
-# --- 4. ฟังก์ชันหลัก ---
-def process_video_stream():
-    if 'cap' not in st.session_state or st.session_state.cap is None:
-        st.session_state.cap = cv2.VideoCapture(0)
-
-    while st.session_state.get('running', False):
-        ret, frame = st.session_state.cap.read()
-        if not ret: break
-
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-        results = detector.detect(mp_image)
-        current_status = "EYES OPEN"
-
-        if results.face_landmarks:
-            face_landmarks = results.face_landmarks[0]
-
-            # --- ส่วนที่เพิ่มใหม่: คำนวณหาขอบสี่เหลี่ยมใบหน้า ---
-            h, w, _ = frame.shape  # ดึงขนาดของวิดีโอมา
-            x_min = int(min([lm.x for lm in face_landmarks]) * w)
-            y_min = int(min([lm.y for lm in face_landmarks]) * h)
-            x_max = int(max([lm.x for lm in face_landmarks]) * w)
-            y_max = int(max([lm.y for lm in face_landmarks]) * h)
-
-            # วาดสี่เหลี่ยมสีแดง (BGR: 0, 0, 255) ความหนา 2
-            cv2.rectangle(frame, (x_min, y_min), (x_max, y_max), (0, 0, 255), 2)
-            # --------------------------------------------------
-
-            # (โค้ดเดิมของคุณที่คำนวณ eye_distance ต่อจากนี้...)
-            p_upper = face_landmarks[159]
-            p_lower = face_landmarks[145]
-            # ...
-            # คำนวณระยะห่างเปลือกตา (EAR แบบง่าย)
-            eye_distance = abs(face_landmarks[159].y - face_landmarks[145].y)
-
-            if eye_distance < 0.01:  # หลับตา
-                st.session_state.COUNTER += 1
-                if st.session_state.COUNTER >= EYE_CLOSED_LIMIT:
-                    current_status = "!!! DROWSY ALERT !!!"
-                    if not st.session_state.ALARM_ON and alarm_sound_enabled:
-                        play_alarm_sound("warningsound.mp3.mp3")
-                        st.session_state.ALARM_ON = True
-                else:
-                    current_status = "Eyes Closed"
-            else:  # ลืมตา
-                st.session_state.COUNTER = 0
-                st.session_state.ALARM_ON = False
-                current_status = "EYES OPEN"
-
-        status_placeholder.markdown(f"Status: **{current_status}**")
-        video_placeholder.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), channels="RGB")
-        time.sleep(0.01)
-
-
-if start_btn:
-    st.session_state.running = True
-    process_video_stream()
-
-if stop_btn:
-    st.session_state.running = False
-    if 'cap' in st.session_state and st.session_state.cap:
-        st.session_state.cap.release()
-        st.session_state.cap = None
-    st.rerun()
-
-# --- ตกแต่งหน้าเว็บด้วย CSS ---
-st.set_page_config(page_title="SafeDrive AI", layout="wide") # ตั้งชื่อ Tab และขยายหน้าจอ
-
+# --- 3. UI สำหรับผู้สูงอายุ ---
 st.markdown("""
     <style>
-    .main {
-        background-color: #f0f2f6;
-    }
     .stButton>button {
         width: 100%;
-        border-radius: 10px;
-        height: 3em;
-        background-color: #FF4B4B;
-        color: white;
+        height: 80px;
+        font-size: 30px !important;
+        border-radius: 20px;
         font-weight: bold;
     }
-    .stCheckbox {
-        background-color: #ffffff;
-        padding: 10px;
-        border-radius: 10px;
-    }
-    .video-container {
-        border: 5px solid #262730;
-        border-radius: 15px;
-        overflow: hidden;
+    .status-box {
+        padding: 20px;
+        border-radius: 20px;
+        text-align: center;
+        font-size: 40px;
+        font-weight: bold;
+        color: white;
+        margin-bottom: 20px;
     }
     </style>
     """, unsafe_allow_html=True)
 
-# --- ส่วนหัวของแอป ---
-st.title("🛡️ SafeDrive AI")
-st.subheader("ระบบ AI ตรวจจับอาการง่วงนอนอัจฉริยะ")
-st.divider()
+st.title("🛡️ ระบบช่วยเตือนคนขับ")
 
-# สร้าง Column แบ่งหน้าจอ
-col1, col2 = st.columns([1, 2])  # col1 กว้าง 1 ส่วน, col2 กว้าง 2 ส่วน
+if 'COUNTER' not in st.session_state: st.session_state.COUNTER = 0
+if 'ALARM_ON' not in st.session_state: st.session_state.ALARM_ON = False
 
-with col1:
-    st.info(
-        "💡 **วิธีใช้งาน**\n1. ปรับค่าความไว (Sensitivity)\n2. กด Start เพื่อเริ่มตรวจจับ\n3. ระบบจะเตือนเมื่อคุณหลับตานานเกินไป")
+# ส่วนแสดงสถานะตัวโตๆ
+status_placeholder = st.empty()
 
+# --- 4. ฟังก์ชันประมวลผลวิดีโอ (WebRTC) ---
+class VideoProcessor:
+    def recv(self, frame):
+        img = frame.to_ndarray(format="bgr24")
+        
+        # แปลงเป็นภาพสำหรับ Mediapipe
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+        results = detector.detect(mp_image)
+        
+        current_status = "NORMAL"
 
+        if results.face_landmarks:
+            face_landmarks = results.face_landmarks[0]
+            
+            # คำนวณระยะห่างเปลือกตา
+            eye_distance = abs(face_landmarks[159].y - face_landmarks[145].y)
 
+            if eye_distance < 0.015: # ค่าความไว (ปรับตามความเหมาะสม)
+                st.session_state.COUNTER += 1
+                if st.session_state.COUNTER > 10:
+                    current_status = "DROWSY"
+            else:
+                st.session_state.COUNTER = 0
+                st.session_state.ALARM_ON = False
+
+        # วาดข้อความแจ้งเตือนลงในวิดีโอ
+        if current_status == "DROWSY":
+            cv2.putText(img, "!!! WARNING !!!", (50, 100), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 255), 5)
+        
+        return av.VideoFrame.from_ndarray(img, format="bgr24")
+
+# --- 5. ปุ่มเริ่ม/หยุด และช่องวิดีโอ ---
+RTC_CONFIG = RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]})
+
+webrtc_ctx = webrtc_streamer(
+    key="driver-monitor",
+    mode=WebRtcMode.SENDRECV,
+    rtc_configuration=RTC_CONFIG,
+    video_processor_factory=VideoProcessor,
+    media_stream_constraints={"video": True, "audio": False},
+    async_processing=True,
+)
+
+# จัดการเสียงเตือน
+if webrtc_ctx.state.playing and st.session_state.COUNTER > 10:
+    status_placeholder.markdown('<div class="status-box" style="background-color: red;">⚠️ ง่วงนอน! หยุดพักด่วน ⚠️</div>', unsafe_allow_html=True)
+    if not st.session_state.ALARM_ON:
+        play_alarm_sound("warningsound.mp3")
+        st.session_state.ALARM_ON = True
+elif webrtc_ctx.state.playing:
+    status_placeholder.markdown('<div class="status-box" style="background-color: green;">✅ ปกติ (ขับขี่ปลอดภัย)</div>', unsafe_allow_html=True)
+else:
+    status_placeholder.info("กดปุ่ม 'Start' ด้านล่างวิดีโอเพื่อเริ่มใช้งาน")
+
+st.info("💡 คำแนะนำ: วางมือถือให้เห็นใบหน้าชัดเจน และแตะหน้าจอ 1 ครั้งเพื่อให้เสียงทำงาน")
